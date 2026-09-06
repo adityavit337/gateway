@@ -13,6 +13,7 @@ const BACKENDS: Backend[] = [
 ];
 const HEALTH_CHECK_INTERVAL_MS = 2_000;
 const HEALTH_CHECK_TIMEOUT_MS = 1_000;
+const FORWARDED_REQUEST_TIMEOUT_MS = 2_000;
 const CLEANUP_INTERVAL_MS = 10_000;
 let nextBackendIndex = 0;
 
@@ -110,6 +111,7 @@ const proxyHandler: Handler = (req, res) => {
 
   // Open a request TO the backend that mirrors the one we received:
   // same method, same path, same headers.
+  let timedOut = false;
   const upstream = http.request(
     {
       host: BACKEND_HOST,
@@ -117,6 +119,7 @@ const proxyHandler: Handler = (req, res) => {
       path: req.url,
       method: req.method,
       headers: req.headers,
+      timeout: FORWARDED_REQUEST_TIMEOUT_MS,
     },
     // This callback fires when the backend starts responding. We copy its
     // status + headers to our client, then stream the body across.
@@ -126,12 +129,32 @@ const proxyHandler: Handler = (req, res) => {
     },
   );
 
+  // A reachable backend can still be too slow. Sending 504 here distinguishes
+  // that case from connection failures (502) and no healthy backends (503).
+  upstream.on("timeout", () => {
+    timedOut = true;
+    if (!res.headersSent) {
+      res.writeHead(504, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "gateway timeout" }));
+    } else {
+      res.destroy();
+    }
+    upstream.destroy(new Error("forwarded request timed out"));
+  });
+
   // If the backend is down/unreachable, don't leave the client hanging —
   // answer 502 Bad Gateway, the standard "proxy couldn't reach upstream" code.
   upstream.on("error", (err) => {
+    if (timedOut) {
+      return;
+    }
     setBackendHealth(backend, false);
-    res.writeHead(502, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "bad gateway", detail: err.message }));
+    if (!res.headersSent) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "bad gateway", detail: err.message }));
+    } else {
+      res.destroy();
+    }
   });
 
   // Stream the client's request BODY to the backend (matters for POST/PUT).
