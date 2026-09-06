@@ -1,0 +1,21 @@
+{
+  "name": "ratelimiter-gateway",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx --test src/rate-limit/*.test.ts",
+    "backend": "tsx src/backend/server.ts",
+    "gateway": "tsx src/gateway/server.ts",
+    "typecheck": "tsc"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
