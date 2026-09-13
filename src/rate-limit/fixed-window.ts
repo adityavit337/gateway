@@ -26,8 +26,6 @@ export function createFixedWindowLimiter({
       const timestamp = now();
       let client = clients.get(key);
 
-      // Each client's window starts with their first request, not at a shared
-      // wall-clock boundary. This preserves the original gateway behavior.
       if (!client || timestamp - client.windowStart >= windowMs) {
         client = { windowStart: timestamp, requestCount: 0 };
         clients.set(key, client);

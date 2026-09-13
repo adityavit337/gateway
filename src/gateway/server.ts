@@ -1,11 +1,9 @@
-// The gateway is a reverse proxy: clients talk to IT, and it forwards their
-// requests to the backend, applying rate limiting before forwarding.
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
-import { createFixedWindowLimiter } from "../rate-limit/fixed-window.js";
-import { createTokenBucketLimiter } from "../rate-limit/token-bucket.js";
-import type { RateLimiter } from "../rate-limit/types.js";
+import { createClient } from "redis";
+import { createRedisRateLimiter } from "../rate-limit/redis.js";
+import type { RateLimitAlgorithm } from "../rate-limit/types.js";
 
-const GATEWAY_PORT = 8080;
+const DEFAULT_GATEWAY_PORT = 8080;
 const BACKEND_HOST = "localhost";
 const BACKENDS: Backend[] = [
   { port: 9000, healthy: true },
@@ -15,19 +13,54 @@ const HEALTH_CHECK_INTERVAL_MS = 2_000;
 const HEALTH_CHECK_TIMEOUT_MS = 1_000;
 const FORWARDED_REQUEST_TIMEOUT_MS = 2_000;
 const CLEANUP_INTERVAL_MS = 10_000;
+const CACHE_TTL_MS = 5_000;
+const REDIS_URL = process.env.REDIS_URL ?? "redis://localhost:6379";
 let nextBackendIndex = 0;
 
-// ---------------------------------------------------------------------------
-// Two tiny types that define our whole architecture:
-//
-//   Handler    = a function that fully deals with one request
-//   Middleware = a function that WRAPS a handler and returns a new handler
-//                which does something extra before/after (or instead of!)
-//                calling the one it wrapped
-// ---------------------------------------------------------------------------
+function getGatewayPort(): number {
+  const configuredPort = process.env.GATEWAY_PORT;
+  if (configuredPort === undefined) return DEFAULT_GATEWAY_PORT;
+
+  const port = Number(configuredPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("GATEWAY_PORT must be an integer between 1 and 65535");
+  }
+  return port;
+}
+
+const gatewayPort = getGatewayPort();
+
+interface CachedResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+  expiresAt: number;
+}
+
+const responseCache = new Map<string, CachedResponse>();
+const cacheCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of responseCache) {
+    if (entry.expiresAt <= now) responseCache.delete(key);
+  }
+}, CLEANUP_INTERVAL_MS);
+cacheCleanup.unref();
+
+function getCacheKey(req: IncomingMessage): string | undefined {
+  if (
+    req.method !== "GET" ||
+    Object.keys(req.headers).some((name) =>
+      ["authorization", "cookie", "range", "cache-control", "pragma",
+        "content-length", "transfer-encoding"].includes(name) || name.startsWith("if-"),
+    )
+  ) return undefined;
+
+  const headers = Object.entries(req.headers).sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify([req.method, req.url, headers]);
+}
+
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 type Middleware = (next: Handler) => Handler;
-type RateLimitAlgorithm = "fixed-window" | "token-bucket";
 interface Backend {
   port: number;
   healthy: boolean;
@@ -43,15 +76,24 @@ function getRateLimitAlgorithm(): RateLimitAlgorithm {
   return algorithm;
 }
 
-function createRateLimiter(algorithm: RateLimitAlgorithm): RateLimiter {
-  if (algorithm === "fixed-window") {
-    return createFixedWindowLimiter({ windowMs: 10_000, maxRequests: 5 });
-  }
-
-  return createTokenBucketLimiter({ capacity: 5, refillIntervalMs: 2_000 });
-}
-
 const rateLimitAlgorithm = getRateLimitAlgorithm();
+const redisClient = createClient({
+  url: REDIS_URL,
+  disableOfflineQueue: true,
+});
+redisClient.on("error", (error) => console.error(`Redis connection error: ${error.message}`));
+
+const rateLimiter = rateLimitAlgorithm === "fixed-window"
+  ? createRedisRateLimiter(redisClient, {
+      algorithm: "fixed-window",
+      windowMs: 10_000,
+      maxRequests: 5,
+    })
+  : createRedisRateLimiter(redisClient, {
+      algorithm: "token-bucket",
+      capacity: 5,
+      refillIntervalMs: 2_000,
+    });
 
 function getNextBackend(): Backend | undefined {
   const healthyBackends = BACKENDS.filter((backend) => backend.healthy);
@@ -96,11 +138,18 @@ function checkAllBackends(): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// The proxy handler: forwards the incoming request to the backend and
-// streams the backend's response back to the client.
-// ---------------------------------------------------------------------------
 const proxyHandler: Handler = (req, res) => {
+  const cacheKey = getCacheKey(req);
+  const cached = cacheKey === undefined ? undefined : responseCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    req.resume();
+    res.writeHead(cached.status, { ...cached.headers, "x-cache": "HIT" });
+    res.end(cached.body);
+    return;
+  }
+  if (cached && cacheKey !== undefined) responseCache.delete(cacheKey);
+  res.setHeader("x-cache", cacheKey === undefined ? "BYPASS" : cached ? "EXPIRED" : "MISS");
+
   // Round robin gives each healthy backend one request in turn.
   const backend = getNextBackend();
   if (!backend) {
@@ -109,8 +158,6 @@ const proxyHandler: Handler = (req, res) => {
     return;
   }
 
-  // Open a request TO the backend that mirrors the one we received:
-  // same method, same path, same headers.
   let timedOut = false;
   const upstream = http.request(
     {
@@ -121,16 +168,39 @@ const proxyHandler: Handler = (req, res) => {
       headers: req.headers,
       timeout: FORWARDED_REQUEST_TIMEOUT_MS,
     },
-    // This callback fires when the backend starts responding. We copy its
-    // status + headers to our client, then stream the body across.
     (backendRes) => {
-      res.writeHead(backendRes.statusCode ?? 502, backendRes.headers);
-      backendRes.pipe(res); // stream: backend -> client, chunk by chunk
+      const status = backendRes.statusCode ?? 502;
+      const headers = { ...backendRes.headers };
+      // The gateway owns this diagnostic header, even if a backend sends one.
+      delete headers["x-cache"];
+      const canStore = cacheKey !== undefined && status >= 200 && status < 300 &&
+        status !== 206 && headers["set-cookie"] === undefined &&
+        headers["cache-control"] === undefined && headers.vary !== "*";
+
+      // An interrupted body must never become a cached successful response.
+      backendRes.on("error", (err) => upstream.destroy(err));
+      if (!canStore) {
+        res.setHeader("x-cache", "BYPASS");
+        res.writeHead(status, headers);
+        backendRes.pipe(res);
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      backendRes.on("data", (chunk: Buffer) => chunks.push(chunk));
+      backendRes.on("end", () => {
+        if (!backendRes.complete || timedOut || res.destroyed || res.writableEnded) return;
+        const body = Buffer.concat(chunks);
+        // TTL starts only after we have received the entire response.
+        responseCache.set(cacheKey, {
+          status, headers, body, expiresAt: Date.now() + CACHE_TTL_MS,
+        });
+        res.writeHead(status, headers);
+        res.end(body);
+      });
     },
   );
 
-  // A reachable backend can still be too slow. Sending 504 here distinguishes
-  // that case from connection failures (502) and no healthy backends (503).
   upstream.on("timeout", () => {
     timedOut = true;
     if (!res.headersSent) {
@@ -142,8 +212,6 @@ const proxyHandler: Handler = (req, res) => {
     upstream.destroy(new Error("forwarded request timed out"));
   });
 
-  // If the backend is down/unreachable, don't leave the client hanging —
-  // answer 502 Bad Gateway, the standard "proxy couldn't reach upstream" code.
   upstream.on("error", (err) => {
     if (timedOut) {
       return;
@@ -157,21 +225,11 @@ const proxyHandler: Handler = (req, res) => {
     }
   });
 
-  // Stream the client's request BODY to the backend (matters for POST/PUT).
-  // For a GET this simply ends the upstream request.
   req.pipe(upstream);
 };
 
-// ---------------------------------------------------------------------------
-// Logging middleware: wraps any handler, logs every request that passes
-// through. This wrapping pattern is THE core idea of the project — the rate
-// limiter below is another middleware exactly like this one, except
-// it will sometimes send a 429 INSTEAD of calling next().
-// ---------------------------------------------------------------------------
 const loggingMiddleware: Middleware = (next) => (req, res) => {
   const start = Date.now();
-  // "finish" fires when the response has fully been sent — so we can log
-  // the status code and how long the request took.
   res.on("finish", () => {
     console.log(
       `${req.method} ${req.url} from ${req.socket.remoteAddress} -> ${res.statusCode} (${Date.now() - start}ms)`,
@@ -180,47 +238,45 @@ const loggingMiddleware: Middleware = (next) => (req, res) => {
   next(req, res); // pass the request along to the wrapped handler
 };
 
-// ---------------------------------------------------------------------------
-// The selected algorithm owns the counters or buckets. This middleware only
-// translates its allow/reject decision into an HTTP response.
-// ---------------------------------------------------------------------------
 const rateLimitMiddleware: Middleware = (next) => {
-  const limiter = createRateLimiter(rateLimitAlgorithm);
-
-  // Prevent inactive clients from staying in memory forever.
-  const cleanup = setInterval(() => {
-    limiter.cleanup();
-  }, CLEANUP_INTERVAL_MS);
-  cleanup.unref(); // This timer alone should not keep the process running.
-
   return (req, res) => {
     // Use the connected peer's IP, not a client-supplied forwarded header.
     const ip = req.socket.remoteAddress ?? "unknown";
-    const decision = limiter.consume(ip);
+    void rateLimiter.consume(ip).then((decision) => {
+      if (!decision.allowed) {
+        const retryAfterSeconds = Math.ceil(decision.retryAfterMs / 1000);
+        res.writeHead(429, {
+          "content-type": "application/json",
+          "retry-after": String(retryAfterSeconds),
+        });
+        res.end(JSON.stringify({ error: "too many requests" }));
+        return; // Stop here: rejected requests never reach the backend.
+      }
 
-    if (!decision.allowed) {
-      const retryAfterSeconds = Math.ceil(decision.retryAfterMs / 1000);
-      res.writeHead(429, {
-        "content-type": "application/json",
-        "retry-after": String(retryAfterSeconds),
-      });
-      res.end(JSON.stringify({ error: "too many requests" }));
-      return; // Stop here: rejected requests never reach the backend.
-    }
-
-    next(req, res);
+      next(req, res);
+    }).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`rate-limit check failed: ${detail}`);
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
+        res.end(JSON.stringify({ error: "rate limiter unavailable" }));
+      }
+    });
   };
 };
 
 // Logging wraps the limiter so it records rejected requests too.
 const handler = loggingMiddleware(rateLimitMiddleware(proxyHandler));
 
+await redisClient.connect();
+console.log("connected to Redis for shared rate limiting");
+
 checkAllBackends();
 const healthChecks = setInterval(checkAllBackends, HEALTH_CHECK_INTERVAL_MS);
 healthChecks.unref();
 
-http.createServer(handler).listen(GATEWAY_PORT, () => {
+http.createServer(handler).listen(gatewayPort, () => {
   console.log(
-    `gateway listening on http://localhost:${GATEWAY_PORT} -> backends ${BACKENDS.map((backend) => backend.port).join(", ")} (${rateLimitAlgorithm})`,
+    `gateway process ${process.pid} listening on http://localhost:${gatewayPort} -> backends ${BACKENDS.map((backend) => backend.port).join(", ")} (${rateLimitAlgorithm}, shared Redis state)`,
   );
 });

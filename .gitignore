@@ -24,3 +24,8 @@ Thumbs.db
 
 # Local learning plan
 ROADMAP.md
+
+# Local interview preparation and tests
+INTERVIEW_PREPARATION.md
+*.test.ts
+*.spec.ts

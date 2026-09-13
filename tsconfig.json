@@ -8,8 +8,6 @@
     // The whole point of TS: maximum strictness catches bugs at compile time.
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    // tsx runs our .ts files directly, so the compiler never emits .js files;
-    // we use `tsc` purely as a type CHECKER (see "typecheck" script).
     "noEmit": true,
     "types": ["node"]
   },

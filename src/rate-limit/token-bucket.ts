@@ -31,8 +31,6 @@ export function createTokenBucketLimiter({
         clients.set(key, client);
       }
 
-      // Calculate earned tokens when needed; no refill timer is required.
-      // Fractions are kept: 1 second earns 0.5 tokens with a 2-second interval.
       const elapsed = Math.max(0, timestamp - client.updatedAt);
       client.tokens = Math.min(capacity, client.tokens + elapsed / refillIntervalMs);
       client.updatedAt = Math.max(timestamp, client.updatedAt);
@@ -55,8 +53,6 @@ export function createTokenBucketLimiter({
       let removed = 0;
       for (const [key, client] of clients) {
         const elapsed = Math.max(0, timestamp - client.updatedAt);
-        // Only forget buckets that would now be full. Recreating a partially
-        // empty bucket would accidentally give the client extra tokens.
         if (client.tokens + elapsed / refillIntervalMs >= capacity) {
           clients.delete(key);
           removed += 1;
