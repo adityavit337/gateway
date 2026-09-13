@@ -193,9 +193,3 @@ src/
     fixed-window.ts          Standalone in-memory reference implementation
     token-bucket.ts           Standalone in-memory reference implementation
 ```
-
-## Validation and scope
-
-Run `npm run typecheck` for static checking and use the scenarios above for manual verification. Test files are maintained locally and excluded from this repository snapshot.
-
-This is a learning and portfolio implementation. The cache has no capacity/body-size limit or request coalescing. Token-bucket timestamps come from gateway clocks, so clock skew can affect results. IP quotas group users behind NAT; behind another proxy, the connected peer may be that proxy. Redis state loss or eviction can reset quotas. Redis high availability, authentication for API clients, TLS termination, graceful shutdown, full HTTP proxy header handling, and production observability are outside the current implementation.
